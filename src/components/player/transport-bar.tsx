@@ -5,6 +5,8 @@ import {
   Minimize,
   Pause,
   Play,
+  RotateCcw,
+  RotateCw,
   Volume2,
   VolumeX,
 } from "lucide-react";
@@ -97,6 +99,34 @@ export function TransportBar({
             </Button>
           </TooltipTrigger>
           <TooltipContent>{playing ? "Pause" : "Play"} · Space</TooltipContent>
+        </Tooltip>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              onClick={() => onSeek(Math.max(0, currentTime - 10))}
+              disabled={!canSeek}
+              aria-label="Seek backward 10 seconds"
+            >
+              <RotateCcw />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>−10 seconds</TooltipContent>
+        </Tooltip>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              onClick={() => onSeek(Math.min(duration, currentTime + 10))}
+              disabled={!canSeek}
+              aria-label="Seek forward 10 seconds"
+            >
+              <RotateCw />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>+10 seconds</TooltipContent>
         </Tooltip>
 
         <div className="flex min-w-0 flex-1 items-center gap-2">

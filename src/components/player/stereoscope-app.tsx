@@ -23,6 +23,11 @@ import { AnaglyphRenderer } from "@/lib/anaglyph/renderer";
 import { usePlayerStore } from "@/lib/anaglyph/store";
 import { VIEW_MODE_LABELS, type StereoSettings } from "@/lib/anaglyph/types";
 import { cn } from "@/lib/utils";
+import {
+  findSubtitleCue,
+  parseSubtitleFile,
+  type SubtitleCue,
+} from "@/lib/anaglyph/subtitle-loader";
 import { ConvertDialog } from "./convert-dialog";
 import { RATES, TransportBar } from "./transport-bar";
 import { SettingsPanel } from "./settings-panel";
@@ -46,6 +51,7 @@ export function StereoscopeApp() {
   const stageRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const subtitleFileRef = useRef<HTMLInputElement>(null);
   const rendererRef = useRef<AnaglyphRenderer | null>(null);
   const demoRef = useRef<DemoScene | null>(null);
   const objectUrlRef = useRef<string | null>(null);
@@ -58,6 +64,11 @@ export function StereoscopeApp() {
 
   const [source, setSource] = useState<SourceKind>("none");
   const [fileName, setFileName] = useState<string | null>(null);
+  const [subtitleCues, setSubtitleCues] = useState<SubtitleCue[]>([]);
+  const [subtitleCue, setSubtitleCue] = useState<SubtitleCue | null>(null);
+  const [subtitleEnabled, setSubtitleEnabled] = useState(false);
+  const [subtitleName, setSubtitleName] = useState<string | null>(null);
+  const [subtitleMenuOpen, setSubtitleMenuOpen] = useState(false);
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -205,6 +216,14 @@ export function StereoscopeApp() {
     };
   }, [clearObjectUrl]);
 
+  useEffect(() => {
+    if (!subtitleEnabled || !subtitleCues.length) {
+      setSubtitleCue(null);
+      return;
+    }
+    setSubtitleCue(findSubtitleCue(subtitleCues, currentTime));
+  }, [currentTime, subtitleCues, subtitleEnabled]);
+
   const togglePlay = useCallback(() => {
     if (sourceRef.current === "demo") {
       setPlaying((p) => !p);
@@ -219,6 +238,34 @@ export function StereoscopeApp() {
       video.pause();
       setPlaying(false);
     }
+  }, []);
+
+  const loadSubtitle = useCallback(async (file: File | null) => {
+    if (!file) return;
+
+    try {
+      const cues = await parseSubtitleFile(file);
+      if (!cues.length) {
+        toast.error("No readable subtitle cues were found.");
+        return;
+      }
+
+      setSubtitleCues(cues);
+      setSubtitleCue(null);
+      setSubtitleEnabled(true);
+      setSubtitleName(file.name);
+      setSubtitleMenuOpen(false);
+      toast.success(`Subtitle loaded: ${file.name}`);
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Could not read subtitle file.",
+      );
+    }
+  }, []);
+
+  const toggleSubtitles = useCallback(() => {
+    setSubtitleEnabled((enabled) => !enabled);
+    setSubtitleMenuOpen(false);
   }, []);
 
   const toggleFullscreen = useCallback(async () => {
@@ -257,10 +304,10 @@ export function StereoscopeApp() {
       } else if (e.key === "ArrowRight" && sourceRef.current === "file" && videoRef.current) {
         videoRef.current.currentTime = Math.min(
           videoRef.current.duration || 0,
-          videoRef.current.currentTime + 5,
+          videoRef.current.currentTime + 10,
         );
       } else if (e.key === "ArrowLeft" && sourceRef.current === "file" && videoRef.current) {
-        videoRef.current.currentTime = Math.max(0, videoRef.current.currentTime - 5);
+        videoRef.current.currentTime = Math.max(0, videoRef.current.currentTime - 10);
       } else if (e.key === "[") {
         usePlayerStore.getState().setSetting(
           "intensity",
@@ -473,6 +520,61 @@ export function StereoscopeApp() {
                   <p className="font-display text-2xl tracking-tight">Drop a film to convert</p>
                 </div>
               ) : null}
+              {subtitleCue && subtitleEnabled ? (
+                <div className="pointer-events-none absolute inset-x-4 bottom-8 z-20 flex justify-center">
+                  <div className="max-w-[90%] rounded bg-black/75 px-4 py-2 text-center text-lg font-medium leading-relaxed text-white shadow-lg whitespace-pre-line">
+                    {subtitleCue.text}
+                  </div>
+                </div>
+              ) : null}
+
+              <div className="absolute right-3 top-3 z-30">
+                <Button
+                  variant={subtitleEnabled && subtitleCues.length ? "secondary" : "ghost"}
+                  size="sm"
+                  onClick={() => setSubtitleMenuOpen((open) => !open)}
+                  disabled={source !== "file"}
+                >
+                  {subtitleEnabled && subtitleCues.length ? "CC On" : "CC Off"}
+                </Button>
+
+                {subtitleMenuOpen ? (
+                  <div className="absolute right-0 mt-2 w-56 rounded-lg border border-border bg-popover p-1 shadow-xl">
+                    <button
+                      type="button"
+                      className="w-full rounded-md px-3 py-2 text-left text-sm hover:bg-muted"
+                      onClick={() => subtitleFileRef.current?.click()}
+                    >
+                      Select subtitle
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!subtitleCues.length}
+                      className="mt-1 w-full rounded-md px-3 py-2 text-left text-sm hover:bg-muted disabled:opacity-40"
+                      onClick={toggleSubtitles}
+                    >
+                      {subtitleEnabled ? "Turn subtitles off" : "Turn subtitles on"}
+                    </button>
+                    {subtitleName ? (
+                      <p className="truncate px-3 py-2 text-[11px] text-muted-foreground">
+                        {subtitleName}
+                      </p>
+                    ) : null}
+                  </div>
+                ) : null}
+              </div>
+
+              <input
+                ref={subtitleFileRef}
+                type="file"
+                accept=".srt,.vtt"
+                className="hidden"
+                onChange={(e) => {
+                  void loadSubtitle(e.target.files?.[0] ?? null);
+                  e.target.value = "";
+                }}
+              />
+
               <video
                 ref={videoRef}
                 className="hidden"
