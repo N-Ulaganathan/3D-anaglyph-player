@@ -1,0 +1,631 @@
+import { useCallback, useEffect, useRef, useState, type DragEvent } from "react";
+import {
+  Clapperboard,
+  Download,
+  FolderOpen,
+  HelpCircle,
+  SlidersHorizontal,
+  X,
+} from "lucide-react";
+import { toast, Toaster } from "sonner";
+import { Button } from "@/components/ui/button";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { DemoScene } from "@/lib/anaglyph/demo-scene";
+import {
+  convertToVideo,
+  DEMO_EXPORT_SECONDS,
+  downloadBlob,
+  exportFileName,
+  pickRecorderMime,
+  type ExportProgress,
+} from "@/lib/anaglyph/exporter";
+import { AnaglyphRenderer } from "@/lib/anaglyph/renderer";
+import { usePlayerStore } from "@/lib/anaglyph/store";
+import { VIEW_MODE_LABELS, type StereoSettings } from "@/lib/anaglyph/types";
+import { cn } from "@/lib/utils";
+import { ConvertDialog } from "./convert-dialog";
+import { RATES, TransportBar } from "./transport-bar";
+import { SettingsPanel } from "./settings-panel";
+
+type SourceKind = "none" | "demo" | "file";
+
+const ACCEPT = ".mp4,.mkv,.webm,.mov,.m4v,video/mp4,video/webm,video/quicktime,video/x-matroska";
+
+function GlassesMark({ className }: { className?: string }) {
+  return (
+    <span className={cn("inline-flex items-center", className)} aria-hidden>
+      <span className="size-2.5 rounded-full bg-lens-red" />
+      <span className="-ml-1 size-2.5 rounded-full bg-lens-cyan" />
+    </span>
+  );
+}
+
+export function StereoscopeApp() {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const rendererRef = useRef<AnaglyphRenderer | null>(null);
+  const demoRef = useRef<DemoScene | null>(null);
+  const objectUrlRef = useRef<string | null>(null);
+  const sourceRef = useRef<SourceKind>("none");
+  const settings = usePlayerStore((s) => s.settings);
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
+  const glassesHintDismissed = usePlayerStore((s) => s.glassesHintDismissed);
+  const dismissGlassesHint = usePlayerStore((s) => s.dismissGlassesHint);
+
+  const [source, setSource] = useState<SourceKind>("none");
+  const [fileName, setFileName] = useState<string | null>(null);
+  const [playing, setPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [volume, setVolume] = useState(0.9);
+  const [muted, setMuted] = useState(false);
+  const [playbackRate, setPlaybackRate] = useState(1);
+  const [fullscreen, setFullscreen] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [engineError, setEngineError] = useState<string | null>(null);
+  const [convertOpen, setConvertOpen] = useState(false);
+  const [converting, setConverting] = useState(false);
+  const [exportProgress, setExportProgress] = useState<ExportProgress | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  const exportSettingsRef = useRef<StereoSettings | null>(null);
+  const convertingRef = useRef(false);
+
+  sourceRef.current = source;
+
+  const clearObjectUrl = useCallback(() => {
+    if (objectUrlRef.current) {
+      URL.revokeObjectURL(objectUrlRef.current);
+      objectUrlRef.current = null;
+    }
+  }, []);
+
+  const startDemo = useCallback(() => {
+    const video = videoRef.current;
+    if (video) {
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
+    }
+    clearObjectUrl();
+    setFileName(null);
+    setSource("demo");
+    setPlaying(true);
+    setCurrentTime(0);
+    setDuration(0);
+  }, [clearObjectUrl]);
+
+  const loadFile = useCallback(
+    (file: File) => {
+      const video = videoRef.current;
+      if (!video) return;
+      const lower = file.name.toLowerCase();
+      const looksVideo =
+        file.type.startsWith("video/") ||
+        /\.(mp4|mkv|webm|mov|m4v|avi)$/.test(lower);
+      if (!looksVideo) {
+        toast.error("That file does not look like a video.");
+        return;
+      }
+      clearObjectUrl();
+      const url = URL.createObjectURL(file);
+      objectUrlRef.current = url;
+      video.src = url;
+      video.load();
+      setFileName(file.name);
+      setSource("file");
+      video
+        .play()
+        .then(() => setPlaying(true))
+        .catch(() => setPlaying(false));
+    },
+    [clearObjectUrl],
+  );
+
+  const demoPausedRef = useRef(false);
+  demoPausedRef.current = source === "demo" && !playing;
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    let raf = 0;
+    let running = true;
+    let demoClock = 0;
+    let lastT = performance.now();
+    const lastUi = { time: -1, playing: true, duration: 0 };
+    try {
+      demoRef.current = new DemoScene(1280, 720);
+      rendererRef.current = new AnaglyphRenderer(canvas);
+    } catch (err) {
+      setEngineError(err instanceof Error ? err.message : "Graphics engine failed");
+      return;
+    }
+    sourceRef.current = "demo";
+    setSource("demo");
+    setPlaying(true);
+    demoRef.current.draw(0);
+    rendererRef.current.setSettings(settingsRef.current);
+    rendererRef.current.setSource(demoRef.current.color, demoRef.current.depth);
+    rendererRef.current.render();
+
+    const loop = (t: number) => {
+      if (!running) return;
+      const dt = (t - lastT) / 1000;
+      lastT = t;
+      const renderer = rendererRef.current;
+      const demo = demoRef.current;
+      if (renderer) {
+        renderer.setSettings(exportSettingsRef.current ?? settingsRef.current);
+        if (sourceRef.current === "demo" && demo) {
+          if (!demoPausedRef.current) demoClock += dt;
+          demo.draw(demoClock);
+          renderer.setSource(demo.color, demo.depth);
+        } else if (sourceRef.current === "file" && videoRef.current) {
+          renderer.setSource(videoRef.current, null);
+        } else {
+          renderer.setSource(null, null);
+        }
+        renderer.render();
+      }
+      const video = videoRef.current;
+      if (video && sourceRef.current === "file") {
+        const time = video.currentTime;
+        const dur = Number.isFinite(video.duration) ? video.duration : 0;
+        const isPlaying = !video.paused;
+        if (
+          Math.abs(time - lastUi.time) > 0.12 ||
+          isPlaying !== lastUi.playing ||
+          dur !== lastUi.duration
+        ) {
+          lastUi.time = time;
+          lastUi.playing = isPlaying;
+          lastUi.duration = dur;
+          setCurrentTime(time);
+          setDuration(dur);
+          setPlaying(isPlaying);
+        }
+      }
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+
+    return () => {
+      running = false;
+      cancelAnimationFrame(raf);
+      rendererRef.current?.destroy();
+      rendererRef.current = null;
+      demoRef.current?.destroy();
+      demoRef.current = null;
+      clearObjectUrl();
+    };
+  }, [clearObjectUrl]);
+
+  const togglePlay = useCallback(() => {
+    if (sourceRef.current === "demo") {
+      setPlaying((p) => !p);
+      return;
+    }
+    const video = videoRef.current;
+    if (!video || sourceRef.current !== "file") return;
+    if (video.paused) {
+      void video.play();
+      setPlaying(true);
+    } else {
+      video.pause();
+      setPlaying(false);
+    }
+  }, []);
+
+  const toggleFullscreen = useCallback(async () => {
+    const root = rootRef.current;
+    if (!root) return;
+    if (!document.fullscreenElement) {
+      await root.requestFullscreen().catch(() => undefined);
+    } else {
+      await document.exitFullscreen().catch(() => undefined);
+    }
+  }, []);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement | null)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      if (e.key === " " || e.code === "Space") {
+        e.preventDefault();
+        if (!convertingRef.current) togglePlay();
+      } else if (e.key === "f" || e.key === "F") {
+        e.preventDefault();
+        void toggleFullscreen();
+      } else if (e.key === "e" || e.key === "E") {
+        if (!convertingRef.current) setConvertOpen(true);
+      } else if (e.key === "o" || e.key === "O") {
+        fileRef.current?.click();
+      } else if (e.key === "d" || e.key === "D") {
+        startDemo();
+      } else if (e.key === "?" || e.key === "h" || e.key === "H") {
+        setHelpOpen((v) => !v);
+      } else if (e.key === "Escape") {
+        setHelpOpen(false);
+        setSettingsOpen(false);
+        if (convertingRef.current) abortRef.current?.abort();
+        else setConvertOpen(false);
+      } else if (e.key === "ArrowRight" && sourceRef.current === "file" && videoRef.current) {
+        videoRef.current.currentTime = Math.min(
+          videoRef.current.duration || 0,
+          videoRef.current.currentTime + 5,
+        );
+      } else if (e.key === "ArrowLeft" && sourceRef.current === "file" && videoRef.current) {
+        videoRef.current.currentTime = Math.max(0, videoRef.current.currentTime - 5);
+      } else if (e.key === "[") {
+        usePlayerStore.getState().setSetting(
+          "intensity",
+          Math.max(0, usePlayerStore.getState().settings.intensity - 0.04),
+        );
+      } else if (e.key === "]") {
+        usePlayerStore.getState().setSetting(
+          "intensity",
+          Math.min(1, usePlayerStore.getState().settings.intensity + 0.04),
+        );
+      } else if (e.key === "1") {
+        usePlayerStore.getState().setSetting("viewMode", "anaglyph");
+      } else if (e.key === "2") {
+        usePlayerStore.getState().setSetting("viewMode", "wiggle");
+      } else if (e.key === "3") {
+        usePlayerStore.getState().setSetting("viewMode", "sbs");
+      } else if (e.key === "4") {
+        usePlayerStore.getState().setSetting("viewMode", "depth");
+      } else if (e.key === "5") {
+        usePlayerStore.getState().setSetting("viewMode", "original");
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [togglePlay, startDemo, toggleFullscreen]);
+
+  useEffect(() => {
+    const onFs = () => setFullscreen(Boolean(document.fullscreenElement));
+    document.addEventListener("fullscreenchange", onFs);
+    return () => document.removeEventListener("fullscreenchange", onFs);
+  }, []);
+
+  const onDrop = (e: DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setDragging(false);
+    const file = e.dataTransfer.files[0];
+    if (file) loadFile(file);
+  };
+
+  const captureFrame = async () => {
+    const blob = await rendererRef.current?.captureFrame();
+    if (!blob) {
+      toast.error("Could not capture this frame.");
+      return;
+    }
+    downloadBlob(blob, `stereoscope-${Date.now()}.png`);
+    toast.success("Frame saved");
+  };
+
+  const startConvert = async () => {
+    const canvas = canvasRef.current;
+    if (!canvas || convertingRef.current) return;
+    const video = videoRef.current;
+    const isDemo = sourceRef.current === "demo";
+    if (!isDemo && (!video || !video.duration)) {
+      toast.error("Open a film before converting.");
+      return;
+    }
+
+    const snapshot = video
+      ? {
+          time: video.currentTime,
+          paused: video.paused,
+          rate: video.playbackRate,
+          muted: video.muted,
+        }
+      : null;
+
+    const settings = { ...settingsRef.current };
+    if (settings.viewMode === "original" || settings.viewMode === "depth") {
+      settings.viewMode = "anaglyph";
+    }
+    exportSettingsRef.current = settings;
+    convertingRef.current = true;
+    setConverting(true);
+    setExportProgress({ ratio: 0, currentTime: 0, duration: isDemo ? DEMO_EXPORT_SECONDS : duration });
+    setPlaying(true);
+
+    const abort = new AbortController();
+    abortRef.current = abort;
+    const bits =
+      settings.quality === "high" ? 12_000_000 : settings.quality === "low" ? 2_500_000 : 8_000_000;
+
+    try {
+      const result = await convertToVideo({
+        canvas,
+        video: isDemo ? null : video,
+        isDemo,
+        duration: isDemo ? DEMO_EXPORT_SECONDS : video?.duration || duration,
+        bitsPerSecond: bits,
+        onProgress: setExportProgress,
+        signal: abort.signal,
+      });
+      downloadBlob(result.blob, exportFileName(fileName, result.ext));
+      toast.success("3D video saved");
+      setConvertOpen(false);
+    } catch (error) {
+      if (!(error instanceof DOMException && error.name === "AbortError")) {
+        toast.error(error instanceof Error ? error.message : "Convert failed");
+      }
+    } finally {
+      convertingRef.current = false;
+      exportSettingsRef.current = null;
+      abortRef.current = null;
+      setConverting(false);
+      setExportProgress(null);
+      if (video && snapshot) {
+        video.playbackRate = snapshot.rate;
+        video.muted = snapshot.muted;
+        video.currentTime = snapshot.time;
+        if (snapshot.paused) video.pause();
+        else void video.play();
+      }
+    }
+  };
+
+  return (
+    <TooltipProvider>
+      <div ref={rootRef} className="flex h-dvh flex-col overflow-hidden bg-background text-foreground">
+        <Toaster theme="dark" position="top-center" />
+        <header className="flex h-14 shrink-0 items-center gap-3 border-b border-border px-3 md:px-5">
+          <GlassesMark />
+          <div className="min-w-0 flex-1">
+            <h1 className="font-display text-lg leading-none tracking-tight md:text-xl">
+              Stereoscope
+            </h1>
+            <p className="hidden text-xs tracking-widest text-muted-foreground uppercase sm:block">
+              Realtime 2D to 3D
+            </p>
+          </div>
+          <Button variant="ghost" size="sm" onClick={startDemo} className="hidden sm:inline-flex">
+            <Clapperboard />
+            Demo
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => fileRef.current?.click()}
+            disabled={converting}
+          >
+            <FolderOpen />
+            <span className="hidden sm:inline">Open film</span>
+          </Button>
+          <Button size="sm" onClick={() => setConvertOpen(true)} disabled={converting}>
+            <Download />
+            Convert
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            className="lg:hidden"
+            onClick={() => setSettingsOpen(true)}
+            aria-label="Open controls"
+          >
+            <SlidersHorizontal />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            onClick={() => setHelpOpen(true)}
+            aria-label="Keyboard shortcuts"
+          >
+            <HelpCircle />
+          </Button>
+        </header>
+
+        {!glassesHintDismissed ? (
+          <div className="flex items-start gap-3 border-b border-border bg-card px-4 py-3 md:items-center md:px-5">
+            <GlassesMark className="mt-1 md:mt-0" />
+            <p className="min-w-0 flex-1 text-sm text-pretty text-muted-foreground">
+              Red lens on the left eye. No glasses? Switch the view to{" "}
+              <button
+                type="button"
+                className="text-foreground underline decoration-border underline-offset-4"
+                onClick={() => usePlayerStore.getState().setSetting("viewMode", "wiggle")}
+              >
+                Wiggle 3D
+              </button>
+              .
+            </p>
+            <Button variant="ghost" size="icon-sm" onClick={dismissGlassesHint} aria-label="Dismiss">
+              <X />
+            </Button>
+          </div>
+        ) : null}
+
+        <div className="flex min-h-0 flex-1">
+          <div className="flex min-w-0 flex-1 flex-col">
+            <div
+              ref={stageRef}
+              className="relative min-h-0 flex-1 bg-background"
+              onDragOver={(e) => {
+                e.preventDefault();
+                setDragging(true);
+              }}
+              onDragLeave={() => setDragging(false)}
+              onDrop={onDrop}
+            >
+              <canvas
+                ref={canvasRef}
+                className="absolute inset-0 size-full bg-background object-contain"
+              />
+              {engineError ? (
+                <p className="absolute inset-0 flex items-center justify-center p-6 text-center text-sm text-muted-foreground">
+                  {engineError}
+                </p>
+              ) : null}
+              {dragging ? (
+                <div className="absolute inset-3 flex items-center justify-center rounded-xl border border-dashed border-primary/40 bg-background/80">
+                  <p className="font-display text-2xl tracking-tight">Drop a film to convert</p>
+                </div>
+              ) : null}
+              <video
+                ref={videoRef}
+                className="hidden"
+                playsInline
+                onError={() => {
+                  toast.error(
+                    "This file could not be decoded. Try MP4 (H.264) or WebM. MKV plays when the browser can decode its codec.",
+                  );
+                }}
+                onLoadedMetadata={() => {
+                  const v = videoRef.current;
+                  if (v && Number.isFinite(v.duration)) setDuration(v.duration);
+                }}
+              />
+              <input
+                ref={fileRef}
+                type="file"
+                accept={ACCEPT}
+                className="hidden"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (file) loadFile(file);
+                  e.target.value = "";
+                }}
+              />
+            </div>
+            <TransportBar
+              isDemo={source === "demo"}
+              fileName={fileName}
+              playing={playing}
+              currentTime={currentTime}
+              duration={duration}
+              volume={volume}
+              muted={muted}
+              playbackRate={playbackRate}
+              fullscreen={fullscreen}
+              onTogglePlay={togglePlay}
+              onSeek={(t) => {
+                if (videoRef.current) videoRef.current.currentTime = t;
+              }}
+              onVolume={(v) => {
+                setVolume(v);
+                setMuted(v === 0);
+                if (videoRef.current) {
+                  videoRef.current.volume = v;
+                  videoRef.current.muted = v === 0;
+                }
+              }}
+              onToggleMute={() => {
+                const next = !muted;
+                setMuted(next);
+                if (videoRef.current) videoRef.current.muted = next;
+              }}
+              onCycleRate={() => {
+                const idx = RATES.indexOf(playbackRate);
+                const next = RATES[(idx + 1) % RATES.length] ?? 1;
+                setPlaybackRate(next);
+                if (videoRef.current) videoRef.current.playbackRate = next;
+              }}
+              onToggleFullscreen={() => void toggleFullscreen()}
+              onCapture={() => void captureFrame()}
+              onConvert={() => setConvertOpen(true)}
+              converting={converting}
+            />
+          </div>
+          <SettingsPanel className="hidden w-80 shrink-0 border-l border-border lg:flex" />
+        </div>
+
+        {settingsOpen ? (
+          <div className="fixed inset-0 z-40 lg:hidden">
+            <button
+              type="button"
+              className="absolute inset-0 bg-background/70"
+              aria-label="Close controls"
+              onClick={() => setSettingsOpen(false)}
+            />
+            <div className="absolute inset-x-0 bottom-0 flex h-5/6 flex-col overflow-hidden rounded-t-xl border-t border-border bg-card shadow-[var(--shadow-border)]">
+              <div className="flex justify-end p-2">
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  onClick={() => setSettingsOpen(false)}
+                  aria-label="Close"
+                >
+                  <X />
+                </Button>
+              </div>
+              <SettingsPanel className="min-h-0 flex-1" />
+            </div>
+          </div>
+        ) : null}
+
+        {helpOpen ? (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+            <button
+              type="button"
+              className="absolute inset-0 bg-background/70"
+              aria-label="Close help"
+              onClick={() => setHelpOpen(false)}
+            />
+            <div className="relative w-full max-w-md rounded-xl bg-card p-6 shadow-[var(--shadow-border)]">
+              <div className="mb-4 flex items-start justify-between gap-3">
+                <h2 className="font-display text-2xl tracking-tight">Shortcuts</h2>
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  onClick={() => setHelpOpen(false)}
+                  aria-label="Close"
+                >
+                  <X />
+                </Button>
+              </div>
+              <ul className="space-y-2 text-sm">
+                {[
+                  ["Space", "Play / pause"],
+                  ["O", "Open a file"],
+                  ["D", "Play the demo reel"],
+                  ["E", "Convert & download"],
+                  ["F", "Fullscreen"],
+                  ["1–5", "Anaglyph / Wiggle / SBS / Depth / Original"],
+                  ["[ ]", "Depth intensity"],
+                  ["← →", "Seek five seconds"],
+                ].map(([k, v]) => (
+                  <li key={k} className="flex justify-between gap-4">
+                    <span className="text-muted-foreground">{v}</span>
+                    <span className="font-medium tabular-nums">{k}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        ) : null}
+
+        <ConvertDialog
+          open={convertOpen}
+          isDemo={source === "demo"}
+          fileName={fileName}
+          duration={duration}
+          formatLabel={pickRecorderMime().ext.toUpperCase()}
+          viewLabel={
+            VIEW_MODE_LABELS[
+              settings.viewMode === "original" || settings.viewMode === "depth"
+                ? "anaglyph"
+                : settings.viewMode
+            ]
+          }
+          converting={converting}
+          progress={exportProgress}
+          onClose={() => setConvertOpen(false)}
+          onStart={() => void startConvert()}
+          onCancel={() => abortRef.current?.abort()}
+        />
+      </div>
+    </TooltipProvider>
+  );
+}
